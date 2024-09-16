@@ -1,0 +1,70 @@
+name: Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v0.2.1
+      with:
+        project_id: ${{ env.PROJECT_ID }}
+        service_account_key: ${{ env.GCP_SA_KEY }}
+        export_default_credentials: true
+
+    - name: Authenticate with Google Cloud
+      run: |
+        echo "$GCP_SA_KEY" | base64 --decode > /tmp/gcp_key.json
+        gcloud auth activate-service-account --key-file=/tmp/gcp_key.json
+
+    - name: Build and push Docker images
+      run: |
+        docker build -t gcr.io/$PROJECT_ID/backend:${{ github.sha }} ./backend
+        docker build -t gcr.io/$PROJECT_ID/frontend:${{ github.sha }} ./frontend
+        gcloud auth configure-docker -q
+        docker push gcr.io/$PROJECT_ID/backend:${{ github.sha }}
+        docker push gcr.io/$PROJECT_ID/frontend:${{ github.sha }}
+
+    - name: Deploy backend services to Cloud Run
+      run: |
+        gcloud run deploy backend --image gcr.io/$PROJECT_ID/backend:${{ github.sha }} --platform managed --region us-central1
+
+    - name: Deploy frontend to Cloud Storage and set up Cloud CDN
+      run: |
+        gsutil rsync -R ./frontend/build gs://$PROJECT_ID-frontend
+        gcloud compute backend-buckets create $PROJECT_ID-frontend-bucket --gcs-bucket-name=$PROJECT_ID-frontend
+        gcloud compute url-maps create $PROJECT_ID-frontend-cdn --default-backend-bucket=$PROJECT_ID-frontend-bucket
+
+    - name: Update Cloud Functions
+      run: |
+        gcloud functions deploy process-data --runtime nodejs14 --trigger-http --source ./functions/process-data
+
+    - name: Run post-deployment tests
+      run: |
+        npm run test:e2e
+
+    - name: Notify team of deployment status
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: Deployment to GCP ${{ job.status == 'success' && 'succeeded' || 'failed' }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+# HUMAN ASSISTANCE NEEDED
+# Please review the following:
+# 1. Ensure that all necessary secrets (GCP_PROJECT_ID, GCP_SA_KEY, SLACK_WEBHOOK) are properly set in the repository settings.
+# 2. Verify that the Google Cloud SDK version is up-to-date and compatible with your project.
+# 3. Confirm that the specified regions and resource names align with your GCP project setup.
+# 4. Review and adjust the deployment commands for backend, frontend, and Cloud Functions to match your specific project structure and requirements.
+# 5. Ensure that the post-deployment test command (npm run test:e2e) is correctly set up in your project.
